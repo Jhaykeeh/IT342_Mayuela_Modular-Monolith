@@ -37,6 +37,7 @@ build/
 .env.local
 *.env
 !.env.example
+application-local.properties
 
 ### Frontend (Vite / React) ###
 frontend/node_modules/
