@@ -16,6 +16,9 @@
   --danger-bg: #fdf0f0;
   --success: #2d6a4f;
   --success-bg: #eef7f1;
+  --warn: #b45309;
+  --warn-bg: #fbf3e7;
+  --surface-alt: #f0ede8;
   --font: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 

@@ -1,7 +1,11 @@
 package edu.cit.mayuela.shop;
 
+import java.util.List;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -20,10 +24,30 @@ public class OrderController {
 
     @PostMapping
     public ResponseEntity<OrderService.OrderResult> createOrder(@RequestBody OrderRequest request) {
-        OrderService.OrderResult result = orderService.placeOrder(request.productId(), request.quantity());
+        if (request.items() == null || request.items().isEmpty()) {
+            return ResponseEntity.badRequest().build();
+        }
+        OrderService.OrderResult result = orderService.placeOrder(request.items());
         return ResponseEntity.ok(result);
     }
 
-    public record OrderRequest(String productId, int quantity) {
+    @PostMapping("/{orderId}/cancel")
+    public ResponseEntity<Void> cancelOrder(@PathVariable Long orderId) {
+        try {
+            orderService.cancelOrder(orderId);
+            return ResponseEntity.ok().build();
+        } catch (OrderService.OrderNotFoundException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+        } catch (OrderService.OrderAlreadyCancelledException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).build();
+        }
+    }
+
+    @GetMapping
+    public ResponseEntity<List<Order>> getOrders() {
+        return ResponseEntity.ok(orderService.getOrders());
+    }
+
+    public record OrderRequest(List<OrderService.OrderItemRequest> items) {
     }
 }

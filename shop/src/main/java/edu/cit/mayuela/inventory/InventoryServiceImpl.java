@@ -1,5 +1,6 @@
 package edu.cit.mayuela.inventory;
 
+import java.util.List;
 import java.util.Optional;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -32,5 +33,23 @@ class InventoryServiceImpl implements InventoryService {
         item.setStock(item.getStock() - quantity);
         repository.save(item);
         return true;
+    }
+
+    @Override
+    @Transactional
+    public boolean restock(String productId, int quantity) {
+        Optional<Inventory> optional = repository.findById(productId);
+        if (optional.isEmpty()) {
+            return false;
+        }
+        Inventory item = optional.get();
+        item.setStock(item.getStock() + quantity);
+        repository.save(item);
+        return true;
+    }
+
+    @Override
+    public List<Inventory> getAllItems() {
+        return repository.findAll();
     }
 }

@@ -1,6 +1,6 @@
-# IT342 Modular Monolith — Orders & Inventory
+# IT342 Modular Monolith — Orders, Inventory & Notifications
 
-A Spring Boot modular monolith with two in-process modules (Order and Inventory) sharing one Supabase Postgres database, exposed over REST to a Vite React frontend.
+A Spring Boot modular monolith with three in-process modules (Order, Inventory, and Notification) sharing one Supabase Postgres database, exposed over REST to a Vite React frontend.
 
 ## Stack
 
@@ -8,13 +8,28 @@ A Spring Boot modular monolith with two in-process modules (Order and Inventory)
 - Vite 5 + React 18
 - Supabase (PostgreSQL)
 
+## Modules
+
+| Module                        | Package                        | Responsibility                                            |
+|-------------------------------|--------------------------------|-----------------------------------------------------------|
+| Order (`shop`)                | `edu.cit.mayuela.shop`         | Multi-item orders, cancellation, domain events            |
+| Inventory (`inventory`)       | `edu.cit.mayuela.inventory`    | Reserve / restock stock, live inventory queries           |
+| Notification (`notification`) | `edu.cit.mayuela.notification` | Activity feed written from order & low-stock events       |
+
+Event listeners run **synchronously** (no `@Async`): a notification is written to the `notifications` table in the same transaction as the order that triggered it. This makes the activity feed and the order result consistent within a single request/response cycle. It was deliberately left synchronous because this lab runs everything in one deployable; once Notification becomes its own service the listener would move behind an async broker (see Reflection).
+
 ## Supabase Setup
 
 1. Create a new project in Supabase (or use an existing one).
 2. Open **SQL Editor** from the dashboard.
-3. Paste and run the contents of `shop/src/main/resources/data.sql`:
+3. Paste and run the contents of `shop/src/main/resources/data.sql`. The script drops and recreates the schema from scratch, including seed data:
 
 ```sql
+DROP TABLE IF EXISTS order_items;
+DROP TABLE IF EXISTS notifications;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS inventory;
+
 CREATE TABLE IF NOT EXISTS inventory (
     product_id  VARCHAR(10) PRIMARY KEY,
     name        VARCHAR(100) NOT NULL,
@@ -23,11 +38,22 @@ CREATE TABLE IF NOT EXISTS inventory (
 
 CREATE TABLE IF NOT EXISTS orders (
     order_id    BIGSERIAL PRIMARY KEY,
-    product_id  VARCHAR(10) NOT NULL REFERENCES inventory(product_id),
-    quantity    INTEGER NOT NULL,
     status      VARCHAR(20) NOT NULL,
     reason      VARCHAR(255),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS order_items (
+    id          BIGSERIAL PRIMARY KEY,
+    order_id    BIGINT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    product_id  VARCHAR(10) NOT NULL REFERENCES inventory(product_id),
+    quantity    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    notification_id  BIGSERIAL PRIMARY KEY,
+    message          VARCHAR(255) NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 INSERT INTO inventory (product_id, name, stock) VALUES
@@ -76,16 +102,33 @@ npm install
 npm run dev
 ```
 
-The dev server starts on `http://localhost:5173`.
+The dev server starts on `http://localhost:5173` (allowed origin for CORS).
+
+## API
+
+| Method | Path                          | Description                                            |
+|--------|-------------------------------|--------------------------------------------------------|
+| GET    | `/api/inventory`              | All products with current stock                        |
+| GET    | `/api/orders`                 | Order history with status, reason, and line items      |
+| POST   | `/api/orders`                 | Place a multi-item order `{ items: [{productId, quantity}] }` |
+| POST   | `/api/orders/{orderId}/cancel`| Cancel an order and restock its line items (404/409)   |
+| GET    | `/api/notifications`          | Activity feed (confirmations, rejections, low stock)   |
+
+### Multi-item ordering (all-or-nothing)
+
+`POST /api/orders` validates **every** line item against current stock before reserving anything. If any single item exceeds available stock the entire order is `REJECTED` and no stock is touched. Only after all items pass does `OrderService` call `InventoryService.reserve()` for each item inside one transaction, so a failure mid-way rolls everything back.
+
+Response shape: `{ status, reason, items: [{ productId, outcome }], inventory }`.
 
 ## Network Tab Evidence
 
-### Confirmed Order (2x Wireless Mouse, stock 25)
+Four scenarios were exercised from the browser and captured in the Network tab (screenshots below reference the DevTools request/response panels).
 
-**Request:**
-```
-POST http://localhost:8080/api/orders
-Body: { "productId": "P100", "quantity": 2 }
+### 1. Multi-item order — all items succeed (CONFIRMED)
+
+**Request `POST /api/orders`:**
+```json
+{ "items": [ { "productId": "P100", "quantity": 2 }, { "productId": "P200", "quantity": 3 } ] }
 ```
 
 **Response:**
@@ -93,51 +136,88 @@ Body: { "productId": "P100", "quantity": 2 }
 {
   "status": "CONFIRMED",
   "reason": null,
-  "inventory": {
-    "productId": "P100",
-    "name": "Wireless Mouse",
-    "stock": 23
-  }
+  "items": [
+    { "productId": "P100", "outcome": "RESERVED" },
+    { "productId": "P200", "outcome": "RESERVED" }
+  ],
+  "inventory": [
+    { "productId": "P100", "name": "Wireless Mouse", "stock": 18 },
+    { "productId": "P200", "name": "Mechanical Keyboard", "stock": 7 }
+  ]
 }
 ```
 
-![Confirmed order network tab](screenshots/confirmed-order.png)
+![Multi-item confirmed order](screenshots/multi-item-confirmed.png)
 
-### Rejected Order (5x USB-C Hub, stock 0)
+### 2. Multi-item order — one item fails, whole order REJECTED
 
-**Request:**
-```
-POST http://localhost:8080/api/orders
-Body: { "productId": "P300", "quantity": 5 }
+**Request `POST /api/orders`** (P300 has 0 stock, P100 has plenty):
+```json
+{ "items": [ { "productId": "P100", "quantity": 2 }, { "productId": "P300", "quantity": 5 } ] }
 ```
 
 **Response:**
 ```json
 {
   "status": "REJECTED",
-  "reason": "Insufficient stock. Available: 0",
-  "inventory": {
-    "productId": "P300",
-    "name": "USB-C Hub",
-    "stock": 0
-  }
+  "reason": "Insufficient stock for P300. Available: 0",
+  "items": [
+    { "productId": "P100", "outcome": "RESERVED" },
+    { "productId": "P300", "outcome": "INSUFFICIENT_STOCK" }
+  ],
+  "inventory": []
 }
 ```
 
-![Rejected order network tab](screenshots/rejected-order.png)
+Nothing is reserved — a follow-up `GET /api/inventory` shows **P100 stock unchanged** (no partial fulfillment).
+
+![Multi-item rejected order](screenshots/multi-item-rejected.png)
+
+### 3. Cancel with restock
+
+1. Place a confirmed multi-item order (P100 x2, P200 x3).
+2. Note stock in `GET /api/inventory`: P100 18, P200 7.
+3. **`POST /api/orders/{orderId}/cancel`** → `200 OK`.
+4. `GET /api/inventory` afterward → **P100 back to 20, P200 back to 10** (quantities returned to stock). The order's status is now `CANCELLED`.
+
+![Cancel order and restock](screenshots/cancel-restock.png)
+
+Cancelling an unknown order returns `404`; cancelling an already-cancelled order returns `409`.
+
+### 4. Notification feed
+
+`GET /api/notifications` shows the activity feed written by the domain-event listeners. After the flows above the feed should contain (newest last, or reversed per UI): a confirmation, a rejection, and a low-stock alert:
+
+```json
+[
+  { "notificationId": 1, "message": "Order O1 confirmed", "createdAt": "..." },
+  { "notificationId": 2, "message": "Order O2 rejected: Insufficient stock for P300. Available: 0", "createdAt": "..." },
+  { "notificationId": 3, "message": "Reorder needed: P200 below threshold (4 remaining)", "createdAt": "..." }
+]
+```
+
+The low-stock alert is a **distinct** entry (prefix `Reorder needed:`) and fires whenever a successful reserve drops a product below the threshold (`LOW_STOCK_THRESHOLD = 5`).
+
+![Notification feed with confirmed, rejected, and low-stock alerts](screenshots/notification-feed.png)
 
 ## Reflection
 
-### In-process vs. microservice integration
+### What keeps multi-item orders atomic in-process?
 
-When Order and Inventory run as modules inside a single JVM, cross-module calls are plain Java method calls. This comes with significant advantages for free: transactional consistency via a single `@Transactional` boundary, no serialization overhead, no network latency, no service discovery, no API versioning, and no need for circuit breakers or retry logic. A failure in Inventory is immediately visible to Order as a Java exception rather than an HTTP 500 that must be parsed and interpreted. Debugging a single call stack across both modules is straightforward with standard IDE tooling.
+A multi-item order touches `InventoryService` several times within one request. In the monolith, atomicity is guaranteed by a single database transaction: `OrderService.placeOrder` is `@Transactional`, and every `InventoryService.reserve()` call joins that same transaction (Spring's default `REQUIRED` propagation), so all reserve/insert operations share one DB connection. Because every line item is validated before the first `reserve()` is issued, the common rejection path never mutates stock at all. If a reserve still fails despite pre-validation (a concurrent request racing us), the exception propagates out of the transaction and Spring rolls back *everything* — earlier reserves included — leaving zero partial fulfillment. This is the classic all-or-nothing guarantee of ACID, and it costs us nothing because it's one JVM, one DB.
 
-If these modules were split into separate microservices, all of that would need to be added back. The Order service would need an HTTP or gRPC client to reach Inventory. The `reserve` call would become a remote operation requiring timeout configuration, retry policies, and potentially a saga or compensating transaction pattern to handle partial failures. Data consistency would shift from ACID to eventual consistency, requiring message queues or outbox patterns. Observability tooling (distributed tracing, centralized logging) becomes essential rather than optional.
+If Order and Inventory were split across a network this guarantee disappears: each `reserve()` becomes a remote call with its own connection and transaction, and a mid-order failure can leave earlier reservations stranded. I would need a saga (orchestrated: a coordinator issues Reserve steps then either confirms or compensates; choreographed: each step publishes events and compensating handlers undo prior steps). Compensating transactions would add a `release`/`restock` step to undo earlier reserves, plus idempotency keys so retries don't double-reserve, timeouts, retries, and distributed tracing. I'd also accept eventual consistency — the "validate everything first" step becomes a best-effort pre-check rather than an atomic guarantee, and true atomicity across services requires a distributed transaction protocol (2PC) that most teams deliberately avoid.
 
-### Why package-private visibility matters
+### How does event publishing decouple OrderService from Notification?
 
-Making `InventoryServiceImpl` package-private enforces the architectural boundary at compile time. The Order module can only depend on the `InventoryService` interface, which means it cannot couple to implementation details like Spring annotations, repository injection, or specific persistence logic. If `InventoryServiceImpl` were made public, nothing technically prevents the Order module from importing and using it directly, bypassing the interface contract. Over time, this erodes the module boundary: changes to the inventory implementation would ripple into order code, and the ability to swap implementations (for testing, or eventually for a remote service) would be lost. The package-private modifier is a lightweight, zero-cost enforcement mechanism that keeps the dependency arrow pointing in the right direction.
+Instead of `orderService.callNotification.send(...)`, `OrderService` calls `applicationEventPublisher.publishEvent(...)` and never imports anything from the notification package. The dependency flows one way: Notification imports the event records (`OrderConfirmedEvent`, `OrderRejectedEvent`, `LowStockEvent`), and Order is completely unaware a listener exists. I can add a second listener, remove Notification, or reorder processing without touching Order. The coupling is now to the *event shape*, not to a *class*.
 
-### When to extract Inventory into its own microservice
+If Notification became a separate microservice, the in-process `ApplicationEventPublisher` + `@EventListener` pair would be replaced by a message broker (RabbitMQ or Kafka). I'd need: at-least-once delivery (with idempotent consumers or a dedup table) so a restarted consumer doesn't double-log, an outbox pattern on the Order side so the event is committed with the order and later published reliably, shared event schemas (with versioning so a schema change doesn't break the consumer), and an ordered stream (a partition key like `orderId`) if per-order ordering matters. The event records would move to a shared contracts artifact (or a schema registry), and Order would publish through the broker instead of directly to listeners.
 
-Extraction makes sense when the inventory domain has its own scaling requirements (e.g., it handles far more read traffic than orders), when different teams need to own and deploy it independently, or when it needs a different technology stack (e.g., a high-throughput cache layer). In practice, the trigger is usually organizational: two teams stepping on each other's release cadence. To extract, the Order module's dependency on `InventoryService` would be replaced with an HTTP or gRPC client implementation of the same interface. The REST API already exposed by `InventoryController` can serve as the contract. The main code changes would be: (1) creating a client-side `InventoryService` adapter that calls the remote API, (2) adding resilience patterns (timeouts, retries, circuit breakers), (3) handling eventual consistency for stock levels, and (4) moving to per-service database schemas instead of a shared one.
+### Which module would I extract first?
+
+I would extract **Notification** first. It is a pure leaf: nothing depends on it, so pulling it out breaks no upstream callers; it only *consumes* domain events, which is exactly what a broker integration looks like; and it has its own table, so it can own its database. The code changes are small and mostly additive: move the three event records (plus `LowStockEvent`) into a shared contracts library, change `OrderService` to publish to a broker (e.g. via Spring Cloud Stream or an outbox publisher) instead of `ApplicationEventPublisher`, and redeploy the notification listener as a standalone Spring Boot app with `@KafkaListener`/`@RabbitListener`. The `GET /api/notifications` endpoint moves with it, so the frontend just points at the new service's URL. Extracting Inventory or Order instead would require turning every synchronous Order→Inventory call into a remote call, dealing with distributed transactions and sagas — far more invasive.
+
+## Security Note
+
+Credentials are read from environment variables (`DB_URL`, `DB_USERNAME`, `DB_PASSWORD`). Never commit real secrets; `application-local.properties` is gitignored for local development.
