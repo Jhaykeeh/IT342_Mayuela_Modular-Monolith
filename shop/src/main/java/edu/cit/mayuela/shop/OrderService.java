@@ -2,28 +2,41 @@ package edu.cit.mayuela.shop;
 
 import edu.cit.mayuela.inventory.Inventory;
 import edu.cit.mayuela.inventory.InventoryService;
+import edu.cit.mayuela.supplier.SupplierGateway;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 @Service
 public class OrderService {
 
+    private static final Logger log = LoggerFactory.getLogger(OrderService.class);
+
     public static final int LOW_STOCK_THRESHOLD = 5;
+
+    /** Units to reorder when stock drops below the threshold. */
+    public static final int REORDER_UNITS = 30;
 
     private final InventoryService inventoryService;
     private final OrderRepository orderRepository;
     private final ApplicationEventPublisher eventPublisher;
+    private final SupplierGateway supplierGateway;
 
     public OrderService(InventoryService inventoryService,
                         OrderRepository orderRepository,
-                        ApplicationEventPublisher eventPublisher) {
+                        ApplicationEventPublisher eventPublisher,
+                        SupplierGateway supplierGateway) {
         this.inventoryService = inventoryService;
         this.orderRepository = orderRepository;
         this.eventPublisher = eventPublisher;
+        this.supplierGateway = supplierGateway;
     }
 
     /**
@@ -80,16 +93,53 @@ public class OrderService {
 
         // Phase 3: capture post-reserve stock and apply the low-stock rule.
         List<Inventory> affected = new ArrayList<>();
+        List<String> lowStockProducts = new ArrayList<>();
         for (OrderItemRequest request : items) {
             Inventory updated = inventoryService.getItem(request.productId()).orElseThrow();
             affected.add(updated);
             if (updated.getStock() < LOW_STOCK_THRESHOLD) {
+                lowStockProducts.add(updated.getProductId());
                 eventPublisher.publishEvent(new LowStockEvent(updated.getProductId(), updated.getStock()));
             }
         }
 
+        // The reorder is placed after the order transaction commits, so a
+        // rolled-back order can never leave an orphan purchase order behind.
+        triggerReorderAfterCommit(lowStockProducts);
+
         eventPublisher.publishEvent(new OrderConfirmedEvent(order.getOrderId()));
         return new OrderResult("CONFIRMED", null, outcomes, affected);
+    }
+
+    /**
+     * Calls the supplier gateway, but only once the surrounding transaction has
+     * committed. The gateway is idempotent per product, so a sweep job running
+     * at the same time cannot produce a duplicate reorder.
+     */
+    private void triggerReorderAfterCommit(List<String> productIds) {
+        if (productIds.isEmpty()) {
+            return;
+        }
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    placeReorders(productIds);
+                }
+            });
+        } else {
+            placeReorders(productIds);
+        }
+    }
+
+    private void placeReorders(List<String> productIds) {
+        for (String productId : productIds) {
+            try {
+                supplierGateway.placeReorder(productId, REORDER_UNITS);
+            } catch (RuntimeException e) {
+                log.warn("Reorder for " + productId + " failed: " + e.getMessage());
+            }
+        }
     }
 
     private OrderResult rejectOrder(List<OrderItemRequest> requests,

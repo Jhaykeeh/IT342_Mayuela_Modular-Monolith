@@ -3,6 +3,7 @@ package edu.cit.mayuela.notification;
 import edu.cit.mayuela.shop.LowStockEvent;
 import edu.cit.mayuela.shop.OrderConfirmedEvent;
 import edu.cit.mayuela.shop.OrderRejectedEvent;
+import edu.cit.mayuela.supplier.SupplierOrderDeliveredEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
@@ -39,5 +40,11 @@ public class NotificationService {
     public void onLowStock(LowStockEvent event) {
         repository.save(new Notification("Reorder needed: " + event.productId()
                 + " below threshold (" + event.remainingStock() + " remaining)"));
+    }
+
+    @EventListener
+    public void onDelivered(SupplierOrderDeliveredEvent event) {
+        repository.save(new Notification("Supplier order " + event.poNumber() + " delivered: "
+                + event.units() + " units restocked for " + event.productId()));
     }
 }
