@@ -24,7 +24,7 @@ public class InventoryDeliveryListener {
 
     @EventListener
     public void onDelivered(SupplierOrderDeliveredEvent event) {
-        boolean restocked = inventoryService.restock(event.productId(), event.units());
+        boolean restocked = inventoryService.deliver(event.productId(), event.units());
         if (restocked) {
             log.info("Delivery restocked {} units of {} (supplier order {})",
                     event.units(), event.productId(), event.poNumber());

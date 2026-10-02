@@ -8,6 +8,7 @@ import java.util.concurrent.RejectedExecutionException;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
  * The anti-corruption layer behind {@link SupplierGateway}.
@@ -61,7 +62,21 @@ class SupplierServiceImpl implements SupplierGateway {
         this.eventPublisher = eventPublisher;
     }
 
+    /**
+     * Creates (or reuses) the open reorder for a product and hands the send to a
+     * background thread.
+     *
+     * Owns its own transaction rather than relying on the caller, because not
+     * every caller has one: the shop deliberately triggers reorders from an
+     * after-commit callback so no HTTP happens inside its order transaction, and
+     * that callback runs with the transaction already finished. Without this the
+     * {@code saveAndFlush} below fails with "No active transaction" and the
+     * shortage is never reordered. When a transaction does exist (a backorder
+     * being settled) this simply joins it, and no HTTP is added to either case
+     * because the send itself is dispatched to {@link #firstAttemptExecutor}.
+     */
     @Override
+    @Transactional
     public ReorderResult placeReorder(String productId, int units) {
         SupplierOrder order;
         synchronized (reorderLock) {
@@ -117,17 +132,30 @@ class SupplierServiceImpl implements SupplierGateway {
         return order;
     }
 
+    /**
+     * Hands the first send to a background thread.
+     *
+     * Only the id crosses the thread boundary. Passing the entity itself would
+     * hand the worker an instance still attached to <em>this</em> thread's
+     * persistence context, so its {@code save} becomes a merge of a detached
+     * instance that races the status poll job on the same row - surfacing as
+     * StaleObjectStateException or "No active transaction" and leaving the
+     * purchase order stuck in PENDING with nobody left to send it. Re-reading
+     * the row on the worker gives it its own session and a version that is
+     * genuinely current.
+     */
     private void submitFirstAttempt(SupplierOrder order) {
+        Long id = order.getId();
         try {
             firstAttemptExecutor.execute(() -> {
                 try {
-                    attemptSend(order);
+                    repository.findById(id).ifPresent(this::attemptSend);
                 } catch (RuntimeException e) {
-                    log.error("First send attempt failed for " + order.getBuyerRef(), e);
+                    log.error("First send attempt failed for supplier order " + id, e);
                 }
             });
         } catch (RejectedExecutionException e) {
-            log.warn("Send executor rejected " + order.getBuyerRef() + "; retry job will send it");
+            log.warn("Send executor rejected supplier order " + id + "; retry job will send it");
         }
     }
 

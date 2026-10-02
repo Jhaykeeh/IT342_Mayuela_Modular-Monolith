@@ -44,8 +44,14 @@ public class OrderService {
      *
      * All line items are validated against current stock BEFORE anything is
      * reserved. If any single item exceeds available stock, the whole order is
-     * rejected and no stock is touched. Only after every item passes validation
-     * does the order call InventoryService.reserve() for each item.
+     * rejected and no stock is touched.
+     *
+     * Reservation itself is atomic per line (a single conditional UPDATE in the
+     * Inventory module), and the whole order runs in one transaction. Two
+     * callers can therefore race here without overselling: whoever loses the
+     * race gets false back from InventoryService.reserve(), and this method
+     * puts back everything it already took before rejecting. All-or-nothing is
+     * guaranteed either by the pre-check or by the compensating release.
      */
     @Transactional
     public OrderResult placeOrder(List<OrderItemRequest> items) {
@@ -72,21 +78,25 @@ public class OrderService {
             ItemOutcome failed = outcomes.stream()
                     .filter(o -> !"RESERVED".equals(o.outcome()))
                     .findFirst().orElseThrow();
-            Inventory affected = inventoryService.getItem(failed.productId()).orElse(null);
-            String reason = affected == null
-                    ? "Product not found: " + failed.productId()
-                    : "Insufficient stock for " + failed.productId()
-                            + ". Available: " + affected.getStock();
-            return rejectOrder(items, outcomes, reason);
+            return rejectOrder(items, outcomes, reasonFor(failed));
         }
 
-        // Phase 2: reserve every item (all passed validation).
+        // Phase 2: reserve every item. Each reservation is atomic; if one line
+        // loses a race against a concurrent order, everything taken so far goes
+        // back and the order is rejected, all inside this same transaction.
+        List<OrderItemRequest> taken = new ArrayList<>();
+        for (OrderItemRequest request : items) {
+            if (!inventoryService.reserve(request.productId(), request.quantity())) {
+                releaseAll(taken);
+                outcomes = withOutcome(outcomes, request.productId(), "INSUFFICIENT_STOCK");
+                return rejectOrder(items, outcomes, reasonFor(
+                        new ItemOutcome(request.productId(), "INSUFFICIENT_STOCK")));
+            }
+            taken.add(request);
+        }
+
         Order order = new Order("CONFIRMED", null);
         for (OrderItemRequest request : items) {
-            boolean reserved = inventoryService.reserve(request.productId(), request.quantity());
-            if (!reserved) {
-                throw new IllegalStateException("Reserve failed unexpectedly for " + request.productId());
-            }
             order.getItems().add(new OrderItem(order, request.productId(), request.quantity()));
         }
         orderRepository.save(order);
@@ -108,7 +118,31 @@ public class OrderService {
         triggerReorderAfterCommit(lowStockProducts);
 
         eventPublisher.publishEvent(new OrderConfirmedEvent(order.getOrderId()));
-        return new OrderResult("CONFIRMED", null, outcomes, affected);
+        return new OrderResult(order.getOrderId(), "CONFIRMED", null, outcomes, affected);
+    }
+
+    /** Gives reserved-but-unused units back inside the caller's transaction. */
+    private void releaseAll(List<OrderItemRequest> taken) {
+        for (OrderItemRequest request : taken) {
+            inventoryService.restock(request.productId(), request.quantity());
+        }
+    }
+
+    private List<ItemOutcome> withOutcome(List<ItemOutcome> outcomes, String productId, String outcome) {
+        List<ItemOutcome> updated = new ArrayList<>();
+        for (ItemOutcome item : outcomes) {
+            updated.add(item.productId().equals(productId) ? new ItemOutcome(productId, outcome) : item);
+        }
+        return updated;
+    }
+
+    private String reasonFor(ItemOutcome failed) {
+        Inventory affected = inventoryService.getItem(failed.productId()).orElse(null);
+        if (affected == null) {
+            return "Product not found: " + failed.productId();
+        }
+        return "Insufficient stock for " + failed.productId()
+                + ". Available: " + affected.getStock();
     }
 
     /**
@@ -151,13 +185,32 @@ public class OrderService {
         }
         orderRepository.save(rejected);
         eventPublisher.publishEvent(new OrderRejectedEvent(rejected.getOrderId(), reason));
-        return new OrderResult("REJECTED", reason, outcomes, new ArrayList<>());
+        return new OrderResult(rejected.getOrderId(), "REJECTED", reason, outcomes, new ArrayList<>());
     }
 
-    /**
-     * Cancels an order and returns every reserved line item to stock.
-     * Throws so callers translate to 404/409.
-     */
+/**
+ * Reports whether an order could be placed right now, without creating one.
+ *
+ * Used by callers that poll a pending order (a marketplace backorder) and must
+ * not fill the order history with rejected attempts while they wait. The answer
+ * is only a hint: {@link #placeOrder} is still the authority, because stock can
+ * change between the check and the reservation.
+ */
+@Transactional(readOnly = true)
+public boolean canFill(List<OrderItemRequest> items) {
+    for (OrderItemRequest request : items) {
+        Optional<Inventory> item = inventoryService.getItem(request.productId());
+        if (item.isEmpty() || item.get().getStock() < request.quantity()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Cancels an order and returns every reserved line item to stock.
+ * Throws so callers translate to 404/409.
+ */
     @Transactional
     public void cancelOrder(Long orderId) {
         Optional<Order> optional = orderRepository.findById(orderId);
@@ -189,7 +242,19 @@ public class OrderService {
     public record ItemOutcome(String productId, String outcome) {
     }
 
-    public record OrderResult(String status,
+    /**
+     * Outcome of a placed order.
+     *
+     * @param orderId   the persisted order; available to both the React UI and
+     *                  the Tiangge channel, which needs it to report the order
+     *                  it just created
+     * @param status    CONFIRMED or REJECTED
+     * @param reason    why the order was rejected, otherwise null
+     * @param items     per line outcome: RESERVED, INSUFFICIENT_STOCK, NOT_FOUND
+     * @param inventory post-order stock of the affected products
+     */
+    public record OrderResult(Long orderId,
+                              String status,
                               String reason,
                               List<ItemOutcome> items,
                               List<Inventory> inventory) {

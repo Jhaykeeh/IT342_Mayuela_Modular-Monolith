@@ -1,5 +1,6 @@
 package edu.cit.mayuela.supplier;
 
+import edu.cit.mayuela.platform.AppInstance;
 import java.time.Duration;
 import java.util.List;
 import java.net.URI;
@@ -8,6 +9,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.io.IOException;
+import java.util.concurrent.Executors;
 import org.springframework.stereotype.Component;
 
 /**
@@ -218,6 +220,9 @@ class LegacySupplyClient {
             if (session != null) {
                 builder.header("X-LS-Session", session);
             }
+            // Identifies this running process, so LegacySupply can tell a restart
+            // from the same client continuing, on every single call.
+            builder.header("X-Client-Instance", AppInstance.instanceId());
             if (requestId != null && !requestId.isBlank()) {
                 builder.header("X-Request-Id", requestId);
             }
